@@ -1,4 +1,4 @@
-from __future__ import absolute_import, print_function
+
 
 import logging
 from six import StringIO
@@ -40,6 +40,7 @@ class TestLog(TestCase):
             logger.removeHandler(test_handler)
             for hdl in old_handlers:
                 logger.addHandler(hdl)
+
 
 class TestSyslog(TestCase):
 

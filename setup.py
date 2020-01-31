@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- encoding: utf-8 -*-
 
 from distutils.core import setup
@@ -9,47 +9,57 @@ from os.path import abspath, dirname, join
 from setuptools import find_packages
 
 __author__ = 'Leif Johansson'
-__version__ = '0.10.0dev'
+__version__ = '1.1.2dev0'
 
 here = abspath(dirname(__file__))
 README = open(join(here, 'README.rst')).read()
 NEWS = open(join(here, 'NEWS.txt')).read()
 
+python_requires='>=3.5';
+
 install_requires = [
-    'lxml >=3.0',
+    'mako',
+    'lxml >=4.1.1',
     'pyyaml >=3.10',
     'pyXMLSecurity >=0.15',
-    'cherrypy >=3.2.0',
+    'cherrypy',
     'iso8601 >=0.1.4',
     'simplejson >=2.6.2',
     'jinja2',
     'httplib2 >=0.7.7',
+    'six>=1.11.0',
     'ipaddr',
-    'publicsuffix',
+    'publicsuffix2',
     'redis',
-    'futures',
     'requests',
     'requests_cache',
     'requests_file',
     'pyconfig',
     'pyyaml',
-    'multiprocess'
+    'multiprocess',
+    'minify',
+    'whoosh',
+    'pyramid',
+    'accept_types >=0.4.1',
+    'apscheduler',
+    'redis-collections',
+    'cachetools',
+    'xmldiff',
+    'gunicorn'
 ]
 
 python_implementation_str = python_implementation()
 
-if not (python_implementation_str == 'CPython' and version_info.major == 2 and (version_info.minor == 6 or version_info.minor == 7)):
-    raise RuntimeError('ERROR: running under unsupported {python_implementation_str:s} version '
-                       '{major_version:d}.{minor_version:d}. Please consult the documentation for supported platforms. '
-                       .format(python_implementation_str=python_implementation_str,
-                               major_version=version_info.major,
-                               minor_version=version_info.minor))
 setup(name='pyFF',
       version=__version__,
       description="Federation Feeder",
       long_description=README + '\n\n' + NEWS,
       classifiers=[
           # Get strings from http://pypi.python.org/pypi?%3Aaction=list_classifiers
+         'Programming Language :: Python :: 3',
+         'Programming Language :: Python :: 3.5',
+         'Programming Language :: Python :: 3.6',
+         'Programming Language :: Python :: 3.7',
       ],
       keywords='identity federation saml metadata',
       author=__author__,
@@ -57,7 +67,7 @@ setup(name='pyFF',
       url='http://blogs.mnt.se',
       license='BSD',
       setup_requires=['nose>=1.0'],
-      tests_require=['pbr', 'coverage', 'nose>=1.0', 'mock', 'mako', 'mockredispy', 'testfixtures'],
+      tests_require=['pbr', 'fakeredis>=1.0.5', 'coverage', 'nose>=1.0', 'mock', 'mako', 'testfixtures', 'wsgi_intercept'],
       test_suite="nose.collector",
       packages=find_packages('src'),
       package_dir={'': 'src'},
@@ -78,8 +88,15 @@ setup(name='pyFF',
       },
       zip_safe=False,
       install_requires=install_requires,
+      scripts=['scripts/mirror-mdq.sh'],
       entry_points={
-          'console_scripts': ['pyff=pyff.md:main', 'pyffd=pyff.mdx:main']
+          'console_scripts': ['pyff=pyff.md:main', 'pyffd=pyff.mdx:main', 'samldiff=pyff.tools:difftool'],
+          'paste.app_factory': [
+             'pyffapp=pyff.wsgi:app_factory'
+          ],
+          'paste.server_runner': [
+             'pyffs=pyff.wsgi:server_runner'
+          ],
       },
       message_extractors={'src': [
           ('**.py', 'python', None),

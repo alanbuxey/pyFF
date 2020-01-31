@@ -1,8 +1,6 @@
-"""Package that contains the basic set of pipes - functions that can be used to put together a processing pipeling
-for pyFF.
 """
-
-from __future__ import absolute_import, print_function
+These are the built-in "pipes" - functions that can be used to put together a processing pipeling for pyFF.
+"""
 
 import base64
 import hashlib
@@ -16,33 +14,40 @@ import operator
 import os
 import re
 import xmlsec
-import yaml
 from iso8601 import iso8601
 from lxml.etree import DocumentInvalid
-from .constants import NS
+
+from .constants import NS, config
 from .decorators import deprecated
-from .logs import log
+from .logs import get_log
 from .pipes import Plumbing, PipeException, PipelineCallback, pipe
-from .stats import set_metadata_info
-from .utils import total_seconds, dumptree, safe_write, root, with_tree, duration2timedelta, xslt_transform, validate_document
-from .samlmd import iter_entities, annotate_entity, set_entity_attributes, discojson
-from .fetch import Resource
-from six import StringIO
+from .utils import total_seconds, dumptree, safe_write, root, with_tree, duration2timedelta, xslt_transform, \
+    validate_document, hash_id, ensure_dir
+from .samlmd import sort_entities, iter_entities, annotate_entity, set_entity_attributes, \
+    discojson_t, set_pubinfo, set_reginfo, find_in_document, entitiesdescriptor, set_nodecountry, resolve_entities
 from six.moves.urllib_parse import urlparse
+from .exceptions import MetadataException
+import six
+import ipaddr
+from pyff.pipes import registry
+from six.moves.urllib_parse import quote_plus
+
 
 __author__ = 'leifj'
 
 FILESPEC_REGEX = "([^ \t\n\r\f\v]+)\s+as\s+([^ \t\n\r\f\v]+)"
+log = get_log(__name__)
 
 
 @pipe
 def dump(req, *opts):
     """
-Print a representation of the entities set on stdout. Useful for testing.
+    Print a representation of the entities set on stdout. Useful for testing.
 
-:param req: The request
-:param opts: Options (unused)
-:return: None
+    :param req: The request
+    :param opts: Options (unused)
+    :return: None
+
     """
     if req.t is not None:
         print(dumptree(req.t))
@@ -50,24 +55,103 @@ Print a representation of the entities set on stdout. Useful for testing.
         print("<EntitiesDescriptor xmlns=\"{}\"/>".format(NS['md']))
 
 
+@pipe(name="map")
+def _map(req, *opts):
+    """
+
+        loop over the entities in a selection
+
+        :param req:
+        :param opts:
+        :return: None
+
+        **Examples**
+
+        .. code-block:: yaml
+
+            - map:
+               - ...statements...
+
+        Executes a set of statements in parallell (using a thread pool).
+
+    """
+
+    def _p(e):
+        entity_id = e.get('entityID')
+        ip = Plumbing(pipeline=req.args, pid="{}.each[{}]".format(req.plumbing.pid, entity_id))
+        ireq = Plumbing.Request(ip, req.md, t=e, scheduler=req.scheduler)
+        ireq.set_id(entity_id)
+        ireq.set_parent(req)
+        return ip.iprocess(ireq)
+
+    from multiprocessing.pool import ThreadPool
+    pool = ThreadPool()
+    result = pool.map(_p, iter_entities(req.t), chunksize=10)
+    log.info("processed {} entities".format(len(result)))
+
+
+@pipe(name="then")
+def _then(req, *opts):
+    """
+    Call a named 'when' clause and return - akin to macro invocations for pyFF
+    """
+    for cb in [PipelineCallback(p, req, store=req.md.store) for p in opts]:
+        req.t = cb(req.t)
+    return req.t
+
+
+@pipe(name="log_entity")
+def _log_entity(req, *opts):
+    """
+    log the request id as it is processed (typically the entity_id)
+    """
+    log.info(req.id)
+    return req.t
+
+
+@pipe(name="print")
+def _print_t(req, *opts):
+    """
+
+    Print whatever is in the active tree without transformation
+
+    :param req: The request
+    :param opts: Options (unused)
+    :return: None
+
+    **Examples**
+
+    .. code-block:: yaml
+
+        - print
+           output: "somewhere.foo"
+
+    """
+    fn = req.args.get('output', None)
+    if fn is not None:
+        safe_write(fn, req.t)
+    else:
+        print(req.t)
+
+
 @pipe
 def end(req, *opts):
     """
-Exit with optional error code and message.
+    Exit with optional error code and message.
 
-:param req: The request
-:param opts: Options (unused)
-:return: None
+    :param req: The request
+    :param opts: Options (unused)
+    :return: None
 
-**Examples**
+    **Examples**
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - end
-    - unreachable
+        - end
+        - unreachable
 
-**Warning** This is very bad if used with pyffd - the server will stop running. If you just want to
-break out of the pipeline, use break instead.
+    **Warning** This is very bad if used with pyffd - the server will stop running. If you just want to
+    break out of the pipeline, use break instead.
 
     """
     code = 0
@@ -82,63 +166,63 @@ break out of the pipeline, use break instead.
 @pipe
 def fork(req, *opts):
     """
-Make a copy of the working tree and process the arguments as a pipleline. This essentially resets the working
-tree and allows a new plumbing to run. Useful for producing multiple outputs from a single source.
+    Make a copy of the working tree and process the arguments as a pipleline. This essentially resets the working
+    tree and allows a new plumbing to run. Useful for producing multiple outputs from a single source.
 
-:param req: The request
-:param opts: Options (unused)
-:return: None
+    :param req: The request
+    :param opts: Options (unused)
+    :return: None
 
-**Examples**
+    **Examples**
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - select  # select all entities
-    - fork:
-        - certreport
-        - publish:
-             output: "/tmp/annotated.xml"
-    - fork:
-        - xslt:
-             stylesheet: tidy.xml
-        - publish:
-             output: "/tmp/clean.xml"
+        - select  # select all entities
+        - fork:
+            - certreport
+            - publish:
+                 output: "/tmp/annotated.xml"
+        - fork:
+            - xslt:
+                 stylesheet: tidy.xml
+            - publish:
+                 output: "/tmp/clean.xml"
 
-The second fork in this example is strictly speaking not necessary since the main plumbing is still active
-but it may help to structure your plumbings this way.
+    The second fork in this example is strictly speaking not necessary since the main plumbing is still active
+    but it may help to structure your plumbings this way.
 
-**Merging**
+    **Merging**
 
-Normally the result of the "inner" plumbing is disgarded - unless published or emit:ed to a calling client
-in the case of the MDX server - but by adding 'merge' to the options with an optional 'merge strategy' the
-behaviour can be changed to merge the result of the inner pipeline back to the parent working document.
+    Normally the result of the "inner" plumbing is disgarded - unless published or emit:ed to a calling client
+    in the case of the MDX server - but by adding 'merge' to the options with an optional 'merge strategy' the
+    behaviour can be changed to merge the result of the inner pipeline back to the parent working document.
 
-The default merge strategy is 'replace_existing' which replaces each EntityDescriptor found in the resulting
-document in the parent document (using the entityID as a pointer). Any python module path ('a.mod.u.le:callable')
-ending in a callable is accepted. If the path doesn't contain a ':' then it is assumed to reference one of the
-standard merge strategies in pyff.merge_strategies.
+    The default merge strategy is 'replace_existing' which replaces each EntityDescriptor found in the resulting
+    document in the parent document (using the entityID as a pointer). Any python module path ('a.mod.u.le:callable')
+    ending in a callable is accepted. If the path doesn't contain a ':' then it is assumed to reference one of the
+    standard merge strategies in pyff.merge_strategies.
 
-For instance the following block can be used to set an attribute on a single entity:
+    For instance the following block can be used to set an attribute on a single entity:
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - fork merge:
-        - select: http://sp.example.com/shibboleth-sp
-        - setattr:
-            attribute: value
+        - fork merge:
+            - select: http://sp.example.com/shibboleth-sp
+            - setattr:
+                attribute: value
 
 
-Note that unless you have a select statement before your fork merge you'll be merging into an empty
-active document which with the default merge strategy of replace_existing will result in an empty
-active document. To avoid this do a select before your fork, thus:
+    Note that unless you have a select statement before your fork merge you'll be merging into an empty
+    active document which with the default merge strategy of replace_existing will result in an empty
+    active document. To avoid this do a select before your fork, thus:
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - select
-    - fork merge:
-        - select: http://sp.example.com/shibboleth-sp
-        - setattr:
-            attribute: value
+        - select
+        - fork merge:
+            - select: http://sp.example.com/shibboleth-sp
+            - setattr:
+                attribute: value
 
     """
     nt = None
@@ -146,7 +230,9 @@ active document. To avoid this do a select before your fork, thus:
         nt = deepcopy(req.t)
 
     ip = Plumbing(pipeline=req.args, pid="%s.fork" % req.plumbing.pid)
-    ireq = Plumbing.Request(ip, req.md, nt)
+    ireq = Plumbing.Request(ip, req.md, t=nt, scheduler=req.scheduler)
+    ireq.set_id(req.id)
+    ireq.set_parent(req)
     ip.iprocess(ireq)
 
     if req.t is not None and ireq.t is not None and len(root(ireq.t)) > 0:
@@ -154,7 +240,9 @@ active document. To avoid this do a select before your fork, thus:
             sn = "pyff.merge_strategies:replace_existing"
             if opts[-1] != 'merge':
                 sn = opts[-1]
-            req.md.merge(req.t, ireq.t, strategy_name=sn)
+            req.md.store.merge(req.t, ireq.t, strategy_name=sn)
+
+    return req.t
 
 
 @pipe(name='any')
@@ -171,23 +259,23 @@ def _any(lst, d):
 @pipe(name='break')
 def _break(req, *opts):
     """
-Break out of a pipeline.
+    Break out of a pipeline.
 
-:param req: The request
-:param opts: Options (unused)
-:return: None
+    :param req: The request
+    :param opts: Options (unused)
+    :return: None
 
-This sets the 'done' request property to True which causes the pipeline to terminate at that point. The method name
-is '_break' but the keyword is 'break' to avoid conflicting with python builtin methods.
+    This sets the 'done' request property to True which causes the pipeline to terminate at that point. The method name
+    is '_break' but the keyword is 'break' to avoid conflicting with python builtin methods.
 
-**Examples**
+    **Examples**
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - one
-    - two
-    - break
-    - unreachable
+        - one
+        - two
+        - break
+        - unreachable
 
     """
     req.done = True
@@ -197,44 +285,43 @@ is '_break' but the keyword is 'break' to avoid conflicting with python builtin 
 @pipe(name='pipe')
 def _pipe(req, *opts):
     """
-Run the argument list as a pipleine.
+    Run the argument list as a pipleine.
 
-:param req: The request
-:param opts: Options (unused)
-:return: None
+    :param req: The request
+    :param opts: Options (unused)
+    :return: None
 
-Unlike fork, pipe does not copy the working document but instead operates on the current active document. The done
-request property is reset to False after the pipeline has been processed. This allows for a classical switch/case
-flow using the following construction:
+    Unlike fork, pipe does not copy the working document but instead operates on the current active document. The done
+    request property is reset to False after the pipeline has been processed. This allows for a classical switch/case
+    flow using the following construction:
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - pipe:
-        - when a:
+        - pipe:
+            - when a:
+                - one
+                - break
+            - when b:
+                - two
+                - break
+
+    In this case if 'a' is present in the request state, then 'one' will be executed and the 'when b' condition will not
+    be tested at all. Note that at the topmost level the pipe is implicit and may be left out.
+
+    .. code-block:: yaml
+
+        - pipe:
             - one
-            - break
-        - when b:
             - two
-            - break
 
-In this case if 'a' is present in the request state, then 'one' will be executed and the 'when b' condition will not
-be tested at all. Note that at the topmost level the pipe is implicit and may be left out.
+    is equivalent to
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - pipe:
         - one
         - two
 
-is equivalent to
-
-.. code-block:: yaml
-
-    - one
-    - two
-
     """
-    # req.process(Plumbing(pipeline=req.args, pid="%s.pipe" % req.plumbing.pid))
     ot = Plumbing(pipeline=req.args, pid="%s.pipe" % req.plumbing.id).iprocess(req)
     req.done = False
     return ot
@@ -243,27 +330,27 @@ is equivalent to
 @pipe
 def when(req, condition, *values):
     """
-Conditionally execute part of the pipeline.
+    Conditionally execute part of the pipeline.
 
-:param req: The request
-:param condition: The condition key
-:param values: The condition values
-:return: None
+    :param req: The request
+    :param condition: The condition key
+    :param values: The condition values
+    :return: None
 
-The inner pipeline is executed if the at least one of the condition values is present for the specified key in
-the request state.
+    The inner pipeline is executed if the at least one of the condition values is present for the specified key in
+    the request state.
 
-**Examples**
+    **Examples**
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - when foo
-        - something
-    - when bar bill
-        - other
+        - when foo
+            - something
+        - when bar bill
+            - other
 
-The condition operates on the state: if 'foo' is present in the state (with any value), then the something branch is
-followed. If 'bar' is present in the state with the value 'bill' then the other branch is followed.
+    The condition operates on the state: if 'foo' is present in the state (with any value), then the something branch is
+    followed. If 'bar' is present in the state with the value 'bill' then the other branch is followed.
     """
     c = req.state.get(condition, None)
     if c is not None and (not values or _any(values, c)):
@@ -274,11 +361,11 @@ followed. If 'bar' is present in the state with the value 'bill' then the other 
 @pipe
 def info(req, *opts):
     """
-Dumps the working document on stdout. Useful for testing.
+    Dumps the working document on stdout. Useful for testing.
 
-:param req: The request
-:param opts: Options (unused)
-:return: None
+    :param req: The request
+    :param opts: Options (unused)
+    :return: None
 
     """
     if req.t is None:
@@ -290,98 +377,172 @@ Dumps the working document on stdout. Useful for testing.
 
 
 @pipe
+def sort(req, *opts):
+    """
+    Sorts the working entities by the value returned by the given xpath.
+    By default, entities are sorted by 'entityID' when the 'order_by [xpath]' option is omitted and
+    otherwise as second criteria.
+    Entities where no value exists for a given xpath are sorted last.
+
+    :param req: The request
+    :param opts: Options: <order_by [xpath]> (see bellow)
+    :return: None
+
+    Options are put directly after "sort". E.g:
+
+    .. code-block:: yaml
+
+        - sort order_by [xpath]
+
+    **Options**
+    - order_by [xpath] : xpath expression selecting to the value used for sorting the entities.
+    """
+    if req.t is None:
+        raise PipeException("Unable to sort empty document.")
+
+    opts = dict(list(zip(opts[0:1], [" ".join(opts[1:])])))
+    opts.setdefault('order_by', None)
+    sort_entities(req.t, opts['order_by'])
+
+    return req.t
+
+
+@pipe
 def publish(req, *opts):
     """
-Publish the working document in XML form.
+    Publish the working document in XML form.
 
-:param req: The request
-:param opts: Options (unused)
-:return: None
+    :param req: The request
+    :param opts: Options (unused)
+    :return: None
 
- Publish takes one argument: path to a file where the document tree will be written.
+     Publish takes one argument: path to a file where the document tree will be written.
 
-**Examples**
+    **Examples**
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - publish: /tmp/idp.xml
+        - publish: /tmp/idp.xml
+
+    The full set of options with their corresponding defaults:
+
+    .. code-block:: yaml
+
+        - publish:
+             output: output
+             raw: false
+             urlencode_filenames: false
+             hash_link: false
+             update_store: true
+             ext: .xml
+
+    If output is an existing directory, publish will write the working tree to a filename in the directory
+    based on the @entityID or @Name attribute. Unless 'raw' is set to true the working tree will be serialized
+    to a string before writing. If true, 'hash_link' will generate a symlink based on the hash id (sha1) for
+    compatibility with MDQ. Unless false, 'update_store' will cause the the current store to be updated with
+    the published artifact. Setting 'ext' allows control over the file extension.
     """
 
     if req.t is None:
         raise PipeException("Empty document submitted for publication")
 
     if req.args is None:
-        raise PipeException("publish must specify output")
+        raise PipeException("Publish must at least specify output")
 
-    try:
-        validate_document(req.t)
-    except DocumentInvalid as ex:
-        log.error(ex.error_log)
-        raise PipeException("XML schema validation failed")
+    if type(req.args) is not dict:
+        req.args = dict(output=req.args[0])
 
-    output_file = None
-    if type(req.args) is dict:
-        output_file = req.args.get("output", None)
-    else:
-        output_file = req.args[0]
+    for t in ('raw', 'update_store', 'hash_link', 'urlencode_filenames'):
+        if t in req.args and type(req.args[t]) is not bool:
+            req.args[t] = strtobool("{}".format(req.args[t]))
+
+    req.args.setdefault('ext', '.xml')
+    req.args.setdefault('output_file', 'output')
+    req.args.setdefault('raw', False)
+    req.args.setdefault('update_store', True)
+    req.args.setdefault('hash_link', False)
+    req.args.setdefault('urlencode_filenames', False)
+
+    output_file = req.args.get("output", None)
+
+    if not req.args.get('raw'):
+        try:
+            validate_document(req.t)
+        except DocumentInvalid as ex:
+            log.error(ex.error_log)
+            raise PipeException("XML schema validation failed")
+
+    def _nop(x):
+        return x
+
+    enc = _nop
+    if req.args.get('urlencode_filenames'):
+        enc = quote_plus
+
     if output_file is not None:
         output_file = output_file.strip()
-        log.debug("publish {}".format(output_file))
         resource_name = output_file
         m = re.match(FILESPEC_REGEX, output_file)
         if m:
             output_file = m.group(1)
             resource_name = m.group(2)
-        log.debug("output_file={}, resource_name={}".format(output_file, resource_name))
         out = output_file
+        data = req.t
+        if not req.args.get('raw'):
+            data = dumptree(req.t)
+
         if os.path.isdir(output_file):
-            out = "{}.xml".format(os.path.join(output_file, req.id))
-        safe_write(out, dumptree(req.t))
-        req.store.update(req.t, tid=resource_name)  # TODO maybe this is not the right thing to do anymore
+            file_name = "{}{}".format(enc(req.id), req.args.get('ext'))
+            out = os.path.join(output_file, file_name)
+            safe_write(out, data, mkdirs=True)
+            if req.args.get('hash_link'):
+                link_name = "{}{}".format(enc(hash_id(req.id)), req.args.get('ext'))
+                link_path = os.path.join(output_file, link_name)
+                if os.path.exists(link_path):
+                    os.unlink(link_path)
+                os.symlink(file_name, link_path)
+        else:
+            safe_write(out, data, mkdirs=True)
+
+        if req.args.get('update_store'):
+            req.store.update(req.t, tid=resource_name)  # TODO maybe this is not the right thing to do anymore
     return req.t
 
 
 @pipe
+@deprecated(reason="stats subsystem was removed")
 def loadstats(req, *opts):
     """
     Log (INFO) information about the result of the last call to load
+
     :param req: The request
     :param opts: Options: (none)
     :return: None
-    """
-    from .stats import metadata
-    _stats = None
-    try:
-        if 'json' in opts:
-            _stats = json.dumps(metadata)
-        else:
-            buf = StringIO()
-            yaml.dump(metadata, buf)
-            _stats = buf.getvalue()
-    except Exception as ex:
-        log.error(ex)
 
-    log.info("pyff loadstats: %s" % _stats)
+    """
+    log.info("pyff loadstats has been deprecated")
 
 
 @pipe
-@deprecated
+@deprecated(reason="replaced with load")
 def remote(req, *opts):
-    """Deprecated. Calls :py:mod:`pyff.pipes.builtins.load`.
+    """
+    Deprecated. Calls :py:mod:`pyff.pipes.builtins.load`.
     """
     return load(req, opts)
 
 
 @pipe
-@deprecated
+@deprecated(reason="replaced with load")
 def local(req, *opts):
-    """Deprecated. Calls :py:mod:`pyff.pipes.builtins.load`.
+    """
+    Deprecated. Calls :py:mod:`pyff.pipes.builtins.load`.
     """
     return load(req, opts)
 
 
 @pipe
-@deprecated
+@deprecated(reason="replaced with load")
 def _fetch(req, *opts):
     return load(req, *opts)
 
@@ -389,40 +550,40 @@ def _fetch(req, *opts):
 @pipe
 def load(req, *opts):
     """
-General-purpose resource fetcher.
+    General-purpose resource fetcher.
 
-    :param req: The request
-    :param opts: Options: See "Options" below
-    :return: None
+        :param req: The request
+        :param opts: Options: See "Options" below
+        :return: None
 
-Supports both remote and local resources. Fetching remote resources is done in parallel using threads.
+    Supports both remote and local resources. Fetching remote resources is done in parallel using threads.
 
-Note: When downloading remote files over HTTPS the TLS server certificate is not validated.
-Note: Default behaviour is to ignore metadata files or entities in MD files that cannot be loaded
+    Note: When downloading remote files over HTTPS the TLS server certificate is not validated.
+    Note: Default behaviour is to ignore metadata files or entities in MD files that cannot be loaded
 
-Options are put directly after "load". E.g:
+    Options are put directly after "load". E.g:
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - load fail_on_error True filter_invalid False:
-      - http://example.com/some_remote_metadata.xml
-      - local_file.xml
-      - /opt/directory_containing_md_files/
+        - load fail_on_error True filter_invalid False:
+          - http://example.com/some_remote_metadata.xml
+          - local_file.xml
+          - /opt/directory_containing_md_files/
 
-**Options**
-Defaults are marked with (*)
-- max_workers <5> : Number of parallel threads to use for loading MD files
-- timeout <120> : Socket timeout when downloading files
-- validate <True*|False> : When true downloaded metadata files are validated (schema validation)
-- fail_on_error <True|False*> : Control whether an error during download, parsing or (optional)validatation of a MD file
-                                does not abort processing of the pipeline. When true a failure aborts and causes pyff
-                                to exit with a non zero exit code. Otherwise errors are logged but ignored.
-- filter_invalid <True*|False> : Controls validation behaviour. When true Entities that fail validation are filtered
-                                 I.e. are not loaded. When false the entire metadata file is either loaded, or not.
-                                 fail_on_error controls whether failure to validating the entire MD file will abort
-                                 processing of the pipeline.
+    **Options**
+    Defaults are marked with (*)
+    - max_workers <5> : Number of parallel threads to use for loading MD files
+    - timeout <120> : Socket timeout when downloading files
+    - validate <True*|False> : When true downloaded metadata files are validated (schema validation)
+    - fail_on_error <True|False*> : Control whether an error during download, parsing or (optional)validatation of a MD file
+                                    does not abort processing of the pipeline. When true a failure aborts and causes pyff
+                                    to exit with a non zero exit code. Otherwise errors are logged but ignored.
+    - filter_invalid <True*|False> : Controls validation behaviour. When true Entities that fail validation are filtered
+                                     I.e. are not loaded. When false the entire metadata file is either loaded, or not.
+                                     fail_on_error controls whether failure to validating the entire MD file will abort
+                                     processing of the pipeline.
     """
-    opts = dict(zip(opts[::2], opts[1::2]))
+    opts = dict(list(zip(opts[::2], opts[1::2])))
     opts.setdefault('timeout', 120)
     opts.setdefault('max_workers', 5)
     opts.setdefault('validate', "True")
@@ -433,8 +594,6 @@ Defaults are marked with (*)
     opts['filter_invalid'] = bool(strtobool(opts['filter_invalid']))
 
     remotes = []
-    store = req.md.store_class()  # start the load process by creating a provisional store object
-    req._store = store
     for x in req.args:
         x = x.strip()
         log.debug("load parsing '%s'" % x)
@@ -444,42 +603,38 @@ Defaults are marked with (*)
             "Usage: load resource [as url] [[verify] verification] [via pipeline] [cleanup pipeline]")
 
         url = r.pop(0)
-        params = dict()
+        params = {"via": [], "cleanup": [], "verify": None, "as": url}
 
         while len(r) > 0:
             elt = r.pop(0)
             if elt in ("as", "verify", "via", "cleanup"):
                 if len(r) > 0:
-                    params[elt] = r.pop(0)
+                    if elt in ("via", "cleanup"):
+                        params[elt].append(r.pop(0))
+                    else:
+                        params[elt] = r.pop(0)
                 else:
-                    raise PipeException("Usage: load resource [as url] [[verify] verification] [via pipeline] [cleanup pipeline]")
+                    raise PipeException(
+                        "Usage: load resource [as url] [[verify] verification] [via pipeline]* [cleanup pipeline]*")
             else:
                 params['verify'] = elt
 
-        for elt in ("verify", "via", "cleanup"):
-            params.setdefault(elt, None)
-
-        params.setdefault('as', url)
-
         if params['via'] is not None:
-            params['via'] = PipelineCallback(params['via'], req, store=store)
+            params['via'] = [PipelineCallback(p, req, store=req.md.store) for p in params['via']]
 
         if params['cleanup'] is not None:
-            params['cleanup'] = PipelineCallback(params['cleanup'], req, store=store)
+            params['cleanup'] = [PipelineCallback(p, req, store=req.md.store) for p in params['cleanup']]
 
         params.update(opts)
 
-        req.md.rm.add(Resource(url, **params))
+        req.md.rm.add_child(url, **params)
 
     log.debug("Refreshing all resources")
-    req.md.rm.reload(fail_on_error=bool(opts['fail_on_error']), store=store)
-    req._store = None
-    req.md.store = store  # commit the store
+    req.md.rm.reload(fail_on_error=bool(opts['fail_on_error']))
 
 
 def _select_args(req):
     args = req.args
-    log.debug("selecting using args: %s" % args)
     if args is None and 'select' in req.state:
         args = [req.state.get('select')]
     if args is None:
@@ -489,92 +644,138 @@ def _select_args(req):
     if args is None or not args:
         args = []
 
+    log.info("selecting using args: %s" % args)
+
     return args
 
 
 @pipe
 def select(req, *opts):
     """
-Select a set of EntityDescriptor elements as the working document.
+    Select a set of EntityDescriptor elements as the working document.
 
-:param req: The request
-:param opts: Options - used for select alias
-:return: returns the result of the operation as a working document
+    :param req: The request
+    :param opts: Options - used for select alias
+    :return: returns the result of the operation as a working document
 
-Select picks and expands elements (with optional filtering) from the active repository you setup using calls
-to :py:mod:`pyff.pipes.builtins.load`. See :py:mod:`pyff.mdrepo.MDRepository.lookup` for a description of the syntax for
-selectors.
+    Select picks and expands elements (with optional filtering) from the active repository you setup using calls
+    to :py:mod:`pyff.pipes.builtins.load`. See :py:mod:`pyff.mdrepo.MDRepository.lookup` for a description of the syntax for
+    selectors.
 
-**Examples**
+    **Examples**
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - select
+        - select
 
-This would select all entities in the active repository.
+    This would select all entities in the active repository.
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - select: "/var/local-metadata"
+        - select: "/var/local-metadata"
 
-This would select all entities found in the directory /var/local-metadata. You must have a call to local to load
-entities from this directory before select statement.
+    This would select all entities found in the directory /var/local-metadata. You must have a call to local to load
+    entities from this directory before select statement.
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - select: "/var/local-metadata!//md:EntityDescriptor[md:IDPSSODescriptor]"
+        - select: "/var/local-metadata!//md:EntityDescriptor[md:IDPSSODescriptor]"
 
-This would selects all IdPs from /var/local-metadata
+    This would selects all IdPs from /var/local-metadata
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - select: "!//md:EntityDescriptor[md:SPSSODescriptor]"
+        - select: "!//md:EntityDescriptor[md:SPSSODescriptor]"
 
-This would select all SPs
+    This would select all SPs
 
-Select statements are not cumulative - a select followed by another select in the plumbing resets the
-working douments to the result of the second select.
+    Select statements are not cumulative - a select followed by another select in the plumbing resets the
+    working douments to the result of the second select.
 
-Most statements except local and remote depend on having a select somewhere in your plumbing and will
-stop the plumbing if the current working document is empty. For instance, running
+    Most statements except local and remote depend on having a select somewhere in your plumbing and will
+    stop the plumbing if the current working document is empty. For instance, running
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - select: "!//md:EntityDescriptor[md:SPSSODescriptor]"
+        - select: "!//md:EntityDescriptor[md:SPSSODescriptor]"
 
-would terminate the plumbing at select if there are no SPs in the local repository. This is useful in
-combination with fork for handling multiple cases in your plumbings.
+    would terminate the plumbing at select if there are no SPs in the local repository. This is useful in
+    combination with fork for handling multiple cases in your plumbings.
 
-The 'as' keyword allows a select to be stored as an alias in the local repository. For instance
+    The 'as' keyword allows a select to be stored as an alias in the local repository. For instance
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - select as foo-2.0: "!//md:EntityDescriptor[md:IDPSSODescriptor]""
+        - select as /foo-2.0: "!//md:EntityDescriptor[md:IDPSSODescriptor]"
 
-would allow you to use /foo-2.0.json to refer to the JSON-version of all IdPs in the current repository.
-Note that you should not include an extension in your "as foo-bla-something" since that would make your
-alias invisible for anything except the corresponding mime type.
+    would allow you to use /foo-2.0.json to refer to the JSON-version of all IdPs in the current repository.
+    Note that you should not include an extension in your "as foo-bla-something" since that would make your
+    alias invisible for anything except the corresponding mime type.
     """
     args = _select_args(req)
     name = req.plumbing.id
-    alias = False
     if len(opts) > 0:
         if opts[0] != 'as' and len(opts) == 1:
             name = opts[0]
-            alias = True
         if opts[0] == 'as' and len(opts) == 2:
             name = opts[1]
-            alias = True
 
-    ot = req.md.entity_set(args, name)
+    entities = resolve_entities(args, lookup_fn=req.md.store.select)
+
+    if req.state.get('match', None):  # TODO - allow this to be passed in via normal arguments
+
+        match = req.state['match']
+
+        if isinstance(match, six.string_types):
+            query = [match.lower()]
+
+        def _strings(elt):
+            lst = []
+            for attr in ['{%s}DisplayName' % NS['mdui'],
+                         '{%s}ServiceName' % NS['md'],
+                         '{%s}OrganizationDisplayName' % NS['md'],
+                         '{%s}OrganizationName' % NS['md'],
+                         '{%s}Keywords' % NS['mdui'],
+                         '{%s}Scope' % NS['shibmd']]:
+                lst.extend([s.text for s in elt.iter(attr)])
+            lst.append(elt.get('entityID'))
+            return [item for item in lst if item is not None]
+
+        def _ip_networks(elt):
+            return [ipaddr.IPNetwork(x.text) for x in elt.iter('{%s}IPHint' % NS['mdui'])]
+
+        def _match(q, elt):
+            q = q.strip()
+            if ':' in q or '.' in q:
+                try:
+                    nets = _ip_networks(elt)
+                    for net in nets:
+                        if ':' in q and ipaddr.IPv6Address(q) in net:
+                            return net
+                        if '.' in q and ipaddr.IPv4Address(q) in net:
+                            return net
+                except ValueError:
+                    pass
+
+            if q is not None and len(q) > 0:
+                tokens = _strings(elt)
+                for tstr in tokens:
+                    for tpart in tstr.split():
+                        if tpart.lower().startswith(q):
+                            return tstr
+            return None
+
+        log.debug("matching {} in {} entities".format(match, len(entities)))
+        entities = list(filter(lambda e: _match(match, e) is not None, entities))
+        log.debug("returning {} entities after match".format(len(entities)))
+
+    ot = entitiesdescriptor(entities, name)
     if ot is None:
         raise PipeException("empty select - stop")
 
-    if alias:
-        nfo = dict(Status='default', Description="Synthetic collection")
-        n = req.store.update(ot, name)
-        nfo['Size'] = str(n)
-        set_metadata_info(name, nfo)
+    if req.plumbing.id != name:
+        log.debug("storing synthentic collection {}".format(name))
+        req.store.update(ot, name)
 
     return ot
 
@@ -582,19 +783,21 @@ alias invisible for anything except the corresponding mime type.
 @pipe(name="filter")
 def _filter(req, *opts):
     """
+
     Refines the working document by applying a filter. The filter expression is a subset of the
     select semantics and syntax:
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - filter:
-        - "!//md:EntityDescriptor[md:SPSSODescriptor]"
-        - "https://idp.example.com/shibboleth"
+        - filter:
+            - "!//md:EntityDescriptor[md:SPSSODescriptor]"
+            - "https://idp.example.com/shibboleth"
 
     This would select all SPs and any entity with entityID "https://idp.example.com/shibboleth"
     from the current working document and return as the new working document. Filter also supports
     the "as <alias>" construction from select allowing new synthetic collections to be created
     from filtered documents.
+
     """
 
     if req.t is None:
@@ -614,15 +817,9 @@ def _filter(req, *opts):
     if args is None or not args:
         args = []
 
-    def _find(member):
-        return req.md.find(req.t, member)
-
-    ot = req.md.entity_set(args, name, lookup_fn=_find, copy=False)
+    ot = entitiesdescriptor(args, name, lookup_fn=lambda member: find_in_document(req.t, member), copy=False)
     if alias:
-        nfo = dict(Status='default', Description="Synthetic collection")
-        n = req.store.update(ot, name)
-        nfo['Size'] = str(n)
-        set_metadata_info(name, nfo)
+        req.store.update(ot, name)
 
     req.t = None
 
@@ -636,16 +833,18 @@ def _filter(req, *opts):
 @pipe
 def pick(req, *opts):
     """
-Select a set of EntityDescriptor elements as a working document but don't validate it.
 
-:param req: The request
-:param opts: Options (unused)
-:return: returns the result of the operation as a working document
+    Select a set of EntityDescriptor elements as a working document but don't validate it.
 
-Useful for testing. See py:mod:`pyff.pipes.builtins.pick` for more information about selecting the document.
+    :param req: The request
+    :param opts: Options (unused)
+    :return: returns the result of the operation as a working document
+
+    Useful for testing. See py:mod:`pyff.pipes.builtins.pick` for more information about selecting the document.
+
     """
     args = _select_args(req)
-    ot = req.md.entity_set(args, req.plumbing.id, validate=False)
+    ot = entitiesdescriptor(args, req.plumbing.id, lookup_fn=req.md.store.lookup, validate=False)
     if ot is None:
         raise PipeException("empty select '%s' - stop" % ",".join(args))
     return ot
@@ -654,14 +853,16 @@ Useful for testing. See py:mod:`pyff.pipes.builtins.pick` for more information a
 @pipe
 def first(req, *opts):
     """
-If the working document is a single EntityDescriptor, strip the outer EntitiesDescriptor element and return it.
 
-:param req: The request
-:param opts: Options (unused)
-:return: returns the first entity descriptor if the working document only contains one
+    If the working document is a single EntityDescriptor, strip the outer EntitiesDescriptor element and return it.
 
-Sometimes (eg when running an MDX pipeline) it is usually expected that if a single EntityDescriptor is being returned
-then the outer EntitiesDescriptor is stripped. This method does exactly that:
+    :param req: The request
+    :param opts: Options (unused)
+    :return: returns the first entity descriptor if the working document only contains one
+
+    Sometimes (eg when running an MDX pipeline) it is usually expected that if a single EntityDescriptor is being returned
+    then the outer EntitiesDescriptor is stripped. This method does exactly that:
+
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
@@ -682,17 +883,25 @@ then the outer EntitiesDescriptor is stripped. This method does exactly that:
 @pipe(name='discojson')
 def _discojson(req, *opts):
     """
-Return a discojuice-compatible json representation of the tree
 
-:param req: The request
-:param opts: Options (unusued)
-:return: returns a JSON array
+    Return a discojuice-compatible json representation of the tree
+
+    .. code-block:: yaml
+      discojson:
+
+    If the config.load_icons directive is set the icons will be returned from a (possibly persistent) local
+    cache & converted to data: URIs
+
+    :param req: The request
+    :param opts: Options (unusued)
+    :return: returns a JSON array
+
     """
 
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
-    res = [discojson(e) for e in iter_entities(req.t)]
+    res = discojson_t(req.t, icon_store=req.md.icon_store)
     res.sort(key=operator.itemgetter('title'))
 
     return json.dumps(res)
@@ -701,47 +910,49 @@ Return a discojuice-compatible json representation of the tree
 @pipe
 def sign(req, *opts):
     """
-Sign the working document.
 
-:param req: The request
-:param opts: Options (unused)
-:return: returns the signed working document
+    Sign the working document.
 
-Sign expects a single dict with at least a 'key' key and optionally a 'cert' key. The 'key' argument references
-either a PKCS#11 uri or the filename containing a PEM-encoded non-password protected private RSA key.
-The 'cert' argument may be empty in which case the cert is looked up using the PKCS#11 token, or may point
-to a file containing a PEM-encoded X.509 certificate.
+    :param req: The request
+    :param opts: Options (unused)
+    :return: returns the signed working document
 
-**PKCS11 URIs**
+    Sign expects a single dict with at least a 'key' key and optionally a 'cert' key. The 'key' argument references
+    either a PKCS#11 uri or the filename containing a PEM-encoded non-password protected private RSA key.
+    The 'cert' argument may be empty in which case the cert is looked up using the PKCS#11 token, or may point
+    to a file containing a PEM-encoded X.509 certificate.
 
-A pkcs11 URI has the form
+    **PKCS11 URIs**
 
-.. code-block:: xml
+    A pkcs11 URI has the form
 
-    pkcs11://<absolute path to SO/DLL>[:slot]/<object label>[?pin=<pin>]
+    .. code-block:: xml
 
-The pin parameter can be used to point to an environment variable containing the pin: "env:<ENV variable>".
-By default pin is "env:PYKCS11PIN" which tells sign to use the pin found in the PYKCS11PIN environment
-variable. This is also the default for PyKCS11 which is used to communicate with the PKCS#11 module.
+        pkcs11://<absolute path to SO/DLL>[:slot]/<object label>[?pin=<pin>]
 
-**Examples**
+    The pin parameter can be used to point to an environment variable containing the pin: "env:<ENV variable>".
+    By default pin is "env:PYKCS11PIN" which tells sign to use the pin found in the PYKCS11PIN environment
+    variable. This is also the default for PyKCS11 which is used to communicate with the PKCS#11 module.
 
-.. code-block:: yaml
+    **Examples**
 
-    - sign:
-        key: pkcs11:///usr/lib/libsofthsm.so/signer
+    .. code-block:: yaml
 
-This would sign the document using the key with label 'signer' in slot 0 of the /usr/lib/libsofthsm.so module.
-Note that you may need to run pyff with env PYKCS11PIN=<pin> .... for this to work. Consult the documentation
-of your PKCS#11 module to find out about any other configuration you may need.
+        - sign:
+            key: pkcs11:///usr/lib/libsofthsm.so/signer
 
-.. code-block:: yaml
+    This would sign the document using the key with label 'signer' in slot 0 of the /usr/lib/libsofthsm.so module.
+    Note that you may need to run pyff with env PYKCS11PIN=<pin> .... for this to work. Consult the documentation
+    of your PKCS#11 module to find out about any other configuration you may need.
 
-    - sign:
-        key: signer.key
-        cert: signer.crt
+    .. code-block:: yaml
 
-This example signs the document using the plain key and cert found in the signer.key and signer.crt files.
+        - sign:
+            key: signer.key
+            cert: signer.crt
+
+    This example signs the document using the plain key and cert found in the signer.key and signer.crt files.
+
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
@@ -771,17 +982,18 @@ This example signs the document using the plain key and cert found in the signer
 @pipe
 def stats(req, *opts):
     """
-Display statistics about the current working document.
 
-:param req: The request
-:param opts: Options (unused)
-:return: always returns the unmodified working document
+    Display statistics about the current working document.
 
-**Examples**
+    :param req: The request
+    :param opts: Options (unused)
+    :return: always returns the unmodified working document
 
-.. code-block:: yaml
+    **Examples**
 
-    - stats
+    .. code-block:: yaml
+
+        - stats
 
     """
     if req.t is None:
@@ -802,18 +1014,36 @@ Display statistics about the current working document.
     return req.t
 
 
+@pipe
+def summary(req, *opts):
+    """
+
+    Display a summary of the repository
+    :param req:
+    :param opts:
+    :return:
+
+    """
+    if req.t is None:
+        raise PipeException("Your pipeline is missing a select statement.")
+
+    return dict(size=req.store.size())
+
+
 @pipe(name='store')
 def _store(req, *opts):
     """
-Save the working document as separate files
 
-:param req: The request
-:param opts: Options (unused)
-:return: always returns the unmodified working document
-    
-Split the working document into EntityDescriptor-parts and save in directory/sha1(@entityID).xml. Note that
-this does not erase files that may already be in the directory. If you want a "clean" directory, remove it
-before you call store.
+    Save the working document as separate files
+
+    :param req: The request
+    :param opts: Options (unused)
+    :return: always returns the unmodified working document
+
+    Split the working document into EntityDescriptor-parts and save in directory/sha1(@entityID).xml. Note that
+    this does not erase files that may already be in the directory. If you want a "clean" directory, remove it
+    before you call store.
+
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
@@ -831,37 +1061,35 @@ before you call store.
         if not os.path.isdir(target_dir):
             os.makedirs(target_dir)
         for e in iter_entities(req.t):
-            eid = e.get('entityID')
-            if eid is None or len(eid) == 0:
-                raise PipeException("Missing entityID in %s" % e)
-            m = hashlib.sha1()
-            m.update(eid)
-            d = m.hexdigest()
-            safe_write("%s.xml" % os.path.join(target_dir, d), dumptree(e, pretty_print=True))
+            fn = hash_id(e, prefix=False)
+            safe_write("%s.xml" % os.path.join(target_dir, fn), dumptree(e, pretty_print=True))
     return req.t
+
 
 
 @pipe
 def xslt(req, *opts):
     """
-Transform the working document using an XSLT file.
 
-:param req: The request
-:param opts: Options (unused)
-:return: the transformation result
+    Transform the working document using an XSLT file.
 
-Apply an XSLT stylesheet to the working document. The xslt pipe takes a set of keyword arguments. The only required
-argument is 'stylesheet' which identifies the xslt resource. This is looked up either in the package or as a
-user-supplied file. The rest of the keyword arguments are made available as string parameters to the XSLT transform.
+    :param req: The request
+    :param opts: Options (unused)
+    :return: the transformation result
 
-**Examples**
+    Apply an XSLT stylesheet to the working document. The xslt pipe takes a set of keyword arguments. The only required
+    argument is 'stylesheet' which identifies the xslt resource. This is looked up either in the package or as a
+    user-supplied file. The rest of the keyword arguments are made available as string parameters to the XSLT transform.
 
-.. code-block:: yaml
+    **Examples**
 
-    - xslt:
-        sylesheet: foo.xsl
-        x: foo
-        y: bar
+    .. code-block:: yaml
+
+        - xslt:
+            sylesheet: foo.xsl
+            x: foo
+            y: bar
+
     """
     if req.t is None:
         raise PipeException("Your plumbing is missing a select statement.")
@@ -870,28 +1098,29 @@ user-supplied file. The rest of the keyword arguments are made available as stri
     if stylesheet is None:
         raise PipeException("xslt requires stylesheet")
 
-    params = dict((k, "\'%s\'" % v) for (k, v) in req.args.items())
+    params = dict((k, "\'%s\'" % v) for (k, v) in list(req.args.items()))
     del params['stylesheet']
     try:
         return xslt_transform(req.t, stylesheet, params)
-        # log.debug(ot)
     except Exception as ex:
-        traceback.print_exc(ex)
+        log.debug(traceback.format_exc())
         raise ex
 
 
 @pipe
 def validate(req, *opts):
     """
-Validate the working document
 
-:param req: The request
-:param opts: Not used
-:return: The unmodified tree
+    Validate the working document
+
+    :param req: The request
+    :param opts: Not used
+    :return: The unmodified tree
 
 
-Generate an exception unless the working tree validates. Validation is done automatically during publication and
-loading of metadata so this call is seldom needed.
+    Generate an exception unless the working tree validates. Validation is done automatically during publication and
+    loading of metadata so this call is seldom needed.
+
     """
     if req.t is not None:
         validate_document(req.t)
@@ -902,27 +1131,28 @@ loading of metadata so this call is seldom needed.
 @pipe
 def prune(req, *opts):
     """
-Prune the active tree, removing all elements matching
 
-:param req: The request
-:param opts: Not used
-:return: The tree with all specified elements removed
+    Prune the active tree, removing all elements matching
+
+    :param req: The request
+    :param opts: Not used
+    :return: The tree with all specified elements removed
 
 
-** Examples**
-.. code-block:: yaml
+    ** Examples**
+    .. code-block:: yaml
 
-    - prune:
-        - .//{http://www.w3.org/2000/09/xmldsig#}Signature
+        - prune:
+            - .//{http://www.w3.org/2000/09/xmldsig#}Signature
 
-This example would drop all Signature elements. Note the use of namespaces.
+    This example would drop all Signature elements. Note the use of namespaces.
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - prune:
-        - .//{http://www.w3.org/2000/09/xmldsig#}Signature[1]
+        - prune:
+            - .//{http://www.w3.org/2000/09/xmldsig#}Signature[1]
 
-This example would drop the first Signature element only.
+    This example would drop the first Signature element only.
 
     """
 
@@ -939,6 +1169,7 @@ This example would drop the first Signature element only.
 
     return req.t
 
+
 @pipe
 def check_xml_namespaces(req, *opts):
     """
@@ -946,47 +1177,72 @@ def check_xml_namespaces(req, *opts):
     :param req: The request
     :param opts: Options (not used)
     :return: always returns the unmodified working document or throws an exception if checks fail
+
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
     def _verify(elt):
-        if isinstance(elt.tag, basestring):
-            for prefix, uri in elt.nsmap.items():
+        if isinstance(elt.tag, six.string_types):
+            for prefix, uri in list(elt.nsmap.items()):
                 if not uri.startswith('urn:'):
                     u = urlparse(uri)
-                    if u.scheme not in ('http','https'):
-                        raise ValueError("Namespace URIs must be be http(s) URIs ('{}' declared on {})".format(uri,elt.tag))
+                    if u.scheme not in ('http', 'https'):
+                        raise MetadataException(
+                            "Namespace URIs must be be http(s) URIs ('{}' declared on {})".format(uri, elt.tag))
 
     with_tree(root(req.t), _verify)
     return req.t
 
 @pipe
+def drop_xsi_type(req, *opts):
+    """
+
+    :param req: The request
+    :param opts: Options (not used)
+    :return: drop all xsi:type declarations
+
+    """
+    if req.t is None:
+        raise PipeException("Your pipeline is missing a select statement.")
+
+    def _drop_xsi_type(elt):
+        try:
+            del elt.attrib["{%s}type" % NS["xsi"]]
+        except Exception as ex:
+            pass
+
+    with_tree(root(req.t), _drop_xsi_type)
+    return req.t
+
+@pipe
 def certreport(req, *opts):
     """
-Generate a report of the certificates (optionally limited by expiration time or key size) found in the selection.
 
-:param req: The request
-:param opts: Options (not used)
-:return: always returns the unmodified working document
+    Generate a report of the certificates (optionally limited by expiration time or key size) found in the selection.
 
-**Examples**
+    :param req: The request
+    :param opts: Options (not used)
+    :return: always returns the unmodified working document
 
-.. code-block:: yaml
+    **Examples**
 
-    - certreport:
-         error_seconds: 0
-         warning_seconds: 864000
-         error_bits: 1024
-         warning_bits: 2048
+    .. code-block:: yaml
 
-For key size checking this will report keys with a size *less* than the size specified, defaulting to errors
-for keys smaller than 1024 bits and warnings for keys smaller than 2048 bits. It should be understood as the
-minimum key size for each report level, as such everything below will create report entries.
+        - certreport:
+             error_seconds: 0
+             warning_seconds: 864000
+             error_bits: 1024
+             warning_bits: 2048
 
-Remember that you need a 'publish' or 'emit' call after certreport in your plumbing to get useful output. PyFF
-ships with a couple of xslt transforms that are useful for turning metadata with certreport annotation into
-HTML.
+    For key size checking this will report keys with a size *less* than the size specified, defaulting to errors
+    for keys smaller than 1024 bits and warnings for keys smaller than 2048 bits. It should be understood as the
+    minimum key size for each report level, as such everything below will create report entries.
+
+    Remember that you need a 'publish' or 'emit' call after certreport in your plumbing to get useful output. PyFF
+    ships with a couple of xslt transforms that are useful for turning metadata with certreport annotation into
+    HTML.
+
     """
 
     if req.t is None:
@@ -1070,29 +1326,32 @@ HTML.
 
                     req.store.update(entity_elt)
             except Exception as ex:
+                log.debug(traceback.format_exc())
                 log.error(ex)
 
 
 @pipe
 def emit(req, ctype="application/xml", *opts):
     """
-Returns a UTF-8 encoded representation of the working tree.
 
-:param req: The request
-:param ctype: The mimetype of the response.
-:param opts: Options (not used)
-:return: unicode data
+    Returns a UTF-8 encoded representation of the working tree.
 
-Renders the working tree as text and sets the digest of the tree as the ETag. If the tree has already been rendered as
-text by an earlier step the text is returned as utf-8 encoded unicode. The mimetype (ctype) will be set in the
-Content-Type HTTP response header.
+    :param req: The request
+    :param ctype: The mimetype of the response.
+    :param opts: Options (not used)
+    :return: unicode data
 
-**Examples**
+    Renders the working tree as text and sets the digest of the tree as the ETag. If the tree has already been rendered as
+    text by an earlier step the text is returned as utf-8 encoded unicode. The mimetype (ctype) will be set in the
+    Content-Type HTTP response header.
 
-.. code-block:: yaml
+    **Examples**
 
-    - emit application/xml:
-    - break
+    .. code-block:: yaml
+
+        - emit application/xml:
+        - break
+
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
@@ -1110,36 +1369,42 @@ Content-Type HTTP response header.
 
     if d is not None:
         m = hashlib.sha1()
+        if not isinstance(d, six.binary_type):
+            d = d.encode("utf-8")
         m.update(d)
         req.state['headers']['ETag'] = m.hexdigest()
     else:
         raise PipeException("Empty")
 
     req.state['headers']['Content-Type'] = ctype
-    return unicode(d.decode('utf-8')).encode("utf-8")
+    if six.PY2:
+        d = six.u(d)
+    return d
 
 
 @pipe
 def signcerts(req, *opts):
     """
-Logs the fingerprints of the signing certs found in the current working tree.
 
-:param req: The request
-:param opts: Options (not used)
-:return: always returns the unmodified working document
+    Logs the fingerprints of the signing certs found in the current working tree.
 
-Useful for testing.
+    :param req: The request
+    :param opts: Options (not used)
+    :return: always returns the unmodified working document
 
-**Examples**
+    Useful for testing.
 
-.. code-block:: yaml
+    **Examples**
 
-    - signcerts
+    .. code-block:: yaml
+
+        - signcerts
+
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
-    for fp, pem in xmlsec.crypto.CertDict(req.t).items():
+    for fp, pem in list(xmlsec.crypto.CertDict(req.t).items()):
         log.info("found signing cert with fingerprint %s" % fp)
     return req.t
 
@@ -1147,35 +1412,37 @@ Useful for testing.
 @pipe
 def finalize(req, *opts):
     """
-Prepares the working document for publication/rendering.
 
-:param req: The request
-:param opts: Options (not used)
-:return: returns the working document with @Name, @cacheDuration and @validUntil set
+    Prepares the working document for publication/rendering.
 
-Set Name, ID, cacheDuration and validUntil on the toplevel EntitiesDescriptor element of the working document. Unless
-explicit provided the @Name is set from the request URI if the pipeline is executed in the pyFF server. The @ID is set
-to a string representing the current date/time and will be prefixed with the string provided, which defaults to '_'. The
-@cacheDuration element must be a valid xsd duration (eg PT5H for 5 hrs) and @validUntil can be either an absolute
-ISO 8601 time string or (more comonly) a relative time on the form
+    :param req: The request
+    :param opts: Options (not used)
+    :return: returns the working document with @Name, @cacheDuration and @validUntil set
 
-.. code-block:: none
+    Set Name, ID, cacheDuration and validUntil on the toplevel EntitiesDescriptor element of the working document. Unless
+    explicit provided the @Name is set from the request URI if the pipeline is executed in the pyFF server. The @ID is set
+    to a string representing the current date/time and will be prefixed with the string provided, which defaults to '_'. The
+    @cacheDuration element must be a valid xsd duration (eg PT5H for 5 hrs) and @validUntil can be either an absolute
+    ISO 8601 time string or (more comonly) a relative time on the form
 
-    \+?([0-9]+d)?\s*([0-9]+h)?\s*([0-9]+m)?\s*([0-9]+s)?
+    .. code-block:: none
+
+        \+?([0-9]+d)?\s*([0-9]+h)?\s*([0-9]+m)?\s*([0-9]+s)?
 
 
-For instance +45d 2m results in a time delta of 45 days and 2 minutes. The '+' sign is optional.
+    For instance +45d 2m results in a time delta of 45 days and 2 minutes. The '+' sign is optional.
 
-If operating on a single EntityDescriptor then @Name is ignored (cf :py:mod:`pyff.pipes.builtins.first`).
+    If operating on a single EntityDescriptor then @Name is ignored (cf :py:mod:`pyff.pipes.builtins.first`).
 
-**Examples**
+    **Examples**
 
-.. code-block:: yaml
+    .. code-block:: yaml
 
-    - finalize:
-        cacheDuration: PT8H
-        validUntil: +10d
-        ID: pyff
+        - finalize:
+            cacheDuration: PT8H
+            validUntil: +10d
+            ID: pyff
+
     """
     if req.t is None:
         raise PipeException("Your plumbing is missing a select statement.")
@@ -1183,13 +1450,24 @@ If operating on a single EntityDescriptor then @Name is ignored (cf :py:mod:`pyf
     e = root(req.t)
     if e.tag == "{%s}EntitiesDescriptor" % NS['md']:
         name = req.args.get('name', None)
-        if name is None or not len(name):
+        if name is None or 0 == len(name):
             name = req.args.get('Name', None)
-        if name is None or not len(name):
+        if name is None or 0 == len(name):
             name = req.state.get('url', None)
-        if name is None or not len(name):
+            if name and 'baseURL' in req.args:
+
+                try:
+                    name_url = urlparse(name)
+                    base_url = urlparse(req.args.get('baseURL'))
+                    name = "{}://{}{}".format(base_url.scheme, base_url.netloc, name_url.path)
+                    log.debug("-------- using Name: %s" % name)
+                except ValueError as ex:
+                    log.debug(ex)
+                    name = None
+        if name is None or 0 == len(name):
             name = e.get('Name', None)
-        if name is not None and len(name):
+
+        if name:
             e.set('Name', name)
 
     now = datetime.utcnow()
@@ -1238,29 +1516,31 @@ If operating on a single EntityDescriptor then @Name is ignored (cf :py:mod:`pyf
 @pipe(name='reginfo')
 def _reginfo(req, *opts):
     """
-Sets registration info extension on EntityDescription element
 
-:param req: The request
-:param opts: Options (not used)
-:return: A modified working document
+    Sets registration info extension on EntityDescription element
 
-Transforms the working document by setting the specified attribute on all of the EntityDescriptor
-elements of the active document.
+    :param req: The request
+    :param opts: Options (not used)
+    :return: A modified working document
 
-**Examples**
+    Transforms the working document by setting the specified attribute on all of the EntityDescriptor
+    elements of the active document.
 
-.. code-block:: yaml
+    **Examples**
 
-    - reginfo:
-       [policy:
-            <lang>: <registration policy URL>]
-       authority: <registrationAuthority URL>
+    .. code-block:: yaml
+
+        - reginfo:
+           [policy:
+                <lang>: <registration policy URL>]
+           authority: <registrationAuthority URL>
+
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
     for e in iter_entities(req.t):
-        req.md.set_reginfo(e, **req.args)
+        set_reginfo(e, **req.args)
 
     return req.t
 
@@ -1268,26 +1548,28 @@ elements of the active document.
 @pipe(name='pubinfo')
 def _pubinfo(req, *opts):
     """
-Sets publication info extension on EntityDescription element
 
-:param req: The request
-:param opts: Options (not used)
-:return: A modified working document
+    Sets publication info extension on EntityDescription element
 
-Transforms the working document by setting the specified attribute on all of the EntityDescriptor
-elements of the active document.
+    :param req: The request
+    :param opts: Options (not used)
+    :return: A modified working document
 
-**Examples**
+    Transforms the working document by setting the specified attribute on all of the EntityDescriptor
+    elements of the active document.
 
-.. code-block:: yaml
+    **Examples**
 
-    - pubinfo:
-       publisher: <publisher URL>
+    .. code-block:: yaml
+
+        - pubinfo:
+           publisher: <publisher URL>
+
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
 
-    req.md.set_pubinfo(root(req.t), **req.args)
+    set_pubinfo(root(req.t), **req.args)
 
     return req.t
 
@@ -1295,26 +1577,28 @@ elements of the active document.
 @pipe(name='setattr')
 def _setattr(req, *opts):
     """
-Sets entity attributes on the working document
 
-:param req: The request
-:param opts: Options (not used)
-:return: A modified working document
+    Sets entity attributes on the working document
 
-Transforms the working document by setting the specified attribute on all of the EntityDescriptor
-elements of the active document.
+    :param req: The request
+    :param opts: Options (not used)
+    :return: A modified working document
 
-**Examples**
+    Transforms the working document by setting the specified attribute on all of the EntityDescriptor
+    elements of the active document.
 
-.. code-block:: yaml
+    **Examples**
 
-    - setattr:
-        attr1: value1
-        attr2: value2
-        ...
+    .. code-block:: yaml
 
-Normally this would be combined with the 'merge' feature of fork to add attributes to the working
-document for later processing.
+        - setattr:
+            attr1: value1
+            attr2: value2
+            ...
+
+    Normally this would be combined with the 'merge' feature of fork to add attributes to the working
+    document for later processing.
+
     """
     if req.t is None:
         raise PipeException("Your pipeline is missing a select statement.")
@@ -1325,3 +1609,42 @@ document for later processing.
         req.store.update(e)
 
     return req.t
+
+
+@pipe(name='nodecountry')
+def _nodecountry(req, *opts):
+    """
+
+    Sets eidas:NodeCountry
+
+    :param req: The request
+    :param opts: Options (not used)
+    :return: A modified working document
+
+    Transforms the working document by setting NodeCountry
+
+    **Examples**
+
+    .. code-block:: yaml
+
+        - nodecountry:
+            country: XX
+
+    Normally this would be combined with the 'merge' feature of fork or in a cleanup pipline to add attributes to
+    the working document for later processing.
+
+    """
+    if req.t is None:
+        raise PipeException("Your pipeline is missing a select statement.")
+
+    for e in iter_entities(req.t):
+        if req.args is not None and 'country' in req.args:
+            set_nodecountry(e, country_code=req.args['country'])
+            req.store.update(e)
+        else:
+            log.error("No country found in arguments to nodecountry")
+
+    return req.t
+
+
+__all__ = [fn.__name__ for fn in registry.values()]

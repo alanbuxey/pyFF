@@ -21,10 +21,6 @@
                         <dd class="col-sm-9">{{ cmdline }}</dd>
                         <dt class="col-sm-3">{{ gettext('System information') }}</dt>
                         <dd class="col-sm-9">{{ sysinfo }}</dd>
-                        <dt class="col-sm-3">{{ gettext('Repository size') }}</dt>
-                        <dd class="col-sm-9">{{ stats['Repository Size'] }}</dd>
-                        <dt class="col-sm-3">{{ gettext('Last update') }}</dt>
-                        <dd class="col-sm-9">{{ stats['Repository Update Time'] }}</dd>
                     </dl>
                 </div>
                 <div class="tab-pane" id="pipeline">
@@ -50,7 +46,15 @@
                                     <td>
                                         <ul class="list-unstyled">
                                             {% for c in resource.children %}
-                                            <li><a href="#{{c.url|sha1}}">{{c.url|truncate(60)}}</a></li>
+                                            <li>
+                                                <b><a href="#{{c.url|sha1}}">{{c.url|truncate(60)}}</a></b>
+                                                <dl class="row container">
+                                                    {% for k,v in c.opts.items() %}
+                                                    <dt class="col-md-4">{{k}}</dt>
+                                                    <dd class="col-md-8">{{v}}</dd>
+                                                    {% endfor %}
+                                                </dl>
+                                            </li>
                                             {% endfor %}
                                         </ul>
                                     </td>

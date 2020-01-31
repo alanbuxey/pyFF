@@ -1,12 +1,13 @@
 import os
-from .utils import parse_xml, root, first_text, dumptree
+from .utils import parse_xml, root, first_text, unicode_stream, find_matching_files
 from .constants import NS
-from .logs import log
+from .logs import get_log
 from xmlsec.crypto import CertDict
 from datetime import datetime
-from six import StringIO
 
 __author__ = 'leifj'
+
+log = get_log(__name__)
 
 
 class ParserException(Exception):
@@ -18,8 +19,19 @@ class ParserException(Exception):
     def raise_wraped(self):
         raise self._wraped
 
+class PyffParser(object):
 
-class NoParser():
+    def to_json(self):
+        return str(self);
+
+
+class NoParser(PyffParser):
+    def __init__(self):
+        pass
+
+    def __str__(self):
+        return "Not a supported type"
+
     def magic(self, content):
         return True
 
@@ -27,108 +39,71 @@ class NoParser():
         raise ParserException("No matching parser found for %s" % resource.url)
 
 
-class DirectoryParser():
-    def __init__(self, ext):
-        self.ext = ext
+class DirectoryParser(PyffParser):
+    def __init__(self, extensions):
+        self.extensions = extensions
+
+    def __str__(self):
+        return "Directory"
 
     def magic(self, content):
         return os.path.isdir(content)
 
-    def _find_matching_files(self, d):
-        log.debug("find files in {}".format(repr(d)))
-        for top, dirs, files in os.walk(d):
-            for dn in dirs:
-                if dn.startswith("."):
-                    dirs.remove(dn)
-
-            for nm in files:
-                if nm.endswith(self.ext):
-                    fn = os.path.join(top, nm)
-                    yield fn
-
     def parse(self, resource, content):
         resource.children = []
+        info = dict()
+        info['Description'] = 'Directory'
+        info['Expiration Time'] = 'never expires'
         n = 0
-        for fn in self._find_matching_files(content):
+        for fn in find_matching_files(content, self.extensions):
             resource.add_child("file://" + fn)
             n += 1
 
         if n == 0:
             raise IOError("no entities found in {}".format(content))
 
+        resource.never_expires = True
+        resource.expire_time = None
+        resource.last_seen = datetime.now()
+
         return dict()
 
 
-class XRDParser():
+class XRDParser(PyffParser):
     def __init__(self):
         pass
+
+    def __str__(self):
+        return "XRD"
 
     def magic(self, content):
         return 'XRD' in content
 
+
     def parse(self, resource, content):
         info = dict()
-        info['Description'] = "XRD links from {}".format(resource.url)
-        t = parse_xml(StringIO(content.encode('utf8')))
+        info['Description'] = "XRD links"
+        info['Expiration Time'] = 'never expires'
+        t = parse_xml(unicode_stream(content))
+
         relt = root(t)
         for xrd in t.iter("{%s}XRD" % NS['xrd']):
             for link in xrd.findall(".//{%s}Link[@rel='%s']" % (NS['xrd'], NS['md'])):
                 link_href = link.get("href")
                 certs = CertDict(link)
-                fingerprints = certs.keys()
+                fingerprints = list(certs.keys())
                 fp = None
                 if len(fingerprints) > 0:
                     fp = fingerprints[0]
                 log.debug("XRD: {} verified by {}".format(link_href, fp))
                 resource.add_child(link_href, verify=fp)
-        resource.last_seen = datetime.now
+        resource.last_seen = datetime.now()
         resource.expire_time = None
+        resource.never_expires = True
         return info
 
 
-class MDServiceListParser():
-    def __init__(self):
-        pass
-
-    def magic(self, content):
-        return 'MetadataServiceList' in content
-
-    def parse(self, resource, content):
-        info = dict()
-        info['Description'] = "eIDAS MetadataServiceList from {}".format(resource.url)
-        t = parse_xml(StringIO(content.encode('utf8')))
-        relt = root(t)
-        info['Version'] = relt.get('Version', '0')
-        info['IssueDate'] = relt.get('IssueDate')
-        info['IssuerName'] = first_text(relt, "{%s}IssuerName" % NS['ser'])
-        info['SchemeIdentifier'] = first_text(relt, "{%s}SchemeIdentifier" % NS['ser'])
-        info['SchemeTerritory'] = first_text(relt, "{%s}SchemeTerritory" % NS['ser'])
-        for mdl in relt.iter("{%s}MetadataList" % NS['ser']):
-            for ml in mdl.iter("{%s}MetadataLocation" % NS['ser']):
-                location = ml.get('Location')
-                if location:
-                    certs = CertDict(ml)
-                    fingerprints = certs.keys()
-                    fp = None
-                    if len(fingerprints) > 0:
-                        fp = fingerprints[0]
-
-                    ep = ml.find("{%s}Endpoint" % NS['ser'])
-                    if ep is not None and fp is not None:
-                        log.debug("MetadataServiceList[{}]: {} verified by {}".format(info['SchemeTerritory'],
-                                  location, fp))
-                        resource.add_child(location,
-                                           verify=fp,
-                                           eidas_territory=mdl.get('Territory'),
-                                           eidas_endpoint_type=ep.get('EndpointType'))
-
-        log.debug("Done parsing eIDAS MetadataServiceList")
-        resource.last_seen = datetime.now
-        resource.expire_time = None
-        return info
-
-
-_parsers = [DirectoryParser('.xml'), XRDParser(), MDServiceListParser(), NoParser()]
+_parsers = [XRDParser(), DirectoryParser(['xml']), NoParser()]
 
 
 def add_parser(parser):
@@ -138,4 +113,5 @@ def add_parser(parser):
 def parse_resource(resource, content):
     for parser in _parsers:
         if parser.magic(content):
+            resource.last_parser = parser
             return parser.parse(resource, content)

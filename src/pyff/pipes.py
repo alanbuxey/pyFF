@@ -4,11 +4,12 @@ transform, sign or output SAML metadata.
 """
 
 import traceback
-from six import StringIO
 import os
 import yaml
-from .utils import resource_string, PyffException
-from .logs import log
+from .utils import resource_string, PyffException, is_text
+from .logs import get_log
+
+log = get_log(__name__)
 
 __author__ = 'leifj'
 
@@ -80,14 +81,14 @@ def load_pipe(d):
     name = None
     args = None
     opts = []
-    if type(d) is str or type(d) is unicode:
+    if is_text(d):
         name, opts = _n(d)
     elif hasattr(d, '__iter__') and not type(d) is dict:
         if not len(d):
             raise PipeException("This does not look like a length of pipe... \n%s" % repr(d))
         name, opts = _n(d[0])
     elif type(d) is dict:
-        k = d.keys()[0]
+        k = list(d.keys())[0]
         name, opts = _n(k)
         args = d[k]
     else:
@@ -113,19 +114,29 @@ A delayed pipeline callback used as a post for parse_saml_metadata
 
     def __init__(self, entry_point, req, store=None):
         self.entry_point = entry_point
-        self.plumbing = Plumbing(req.plumbing.pipeline, "%s-via-%s" % (req.plumbing.id, entry_point))
+        self.plumbing = Plumbing(req.scope_of(entry_point).plumbing.pipeline, "%s-via-%s" % (req.plumbing.id, entry_point))
         self.req = req
         self.store = store
 
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
     def __call__(self, *args, **kwargs):
-        log.debug("called %s" % repr(self.plumbing))
+        log.debug("{!s}: called".format(self.plumbing))
         t = args[0]
         if t is None:
             raise ValueError("PipelineCallback must be called with a parse-tree argument")
         try:
-            return self.plumbing.process(self.req.md, args=kwargs, store=self.store, state={self.entry_point: True}, t=t)
+            state = kwargs
+            state[self.entry_point] = True
+            log.debug("state: {}".format(repr(state)))
+            return self.plumbing.process(self.req.md, store=self.store, state=state, t=t)
         except Exception as ex:
-            traceback.print_exc(ex)
+            log.debug(traceback.format_exc())
+            log.error(ex)
             raise ex
 
 
@@ -162,6 +173,9 @@ would then be signed (using signer.key) and finally published in /var/metadata/p
         self._id = pid
         self.pipeline = pipeline
 
+    def to_json(self):
+        return self.pipeline
+
     @property
     def id(self):
         return self._id
@@ -174,7 +188,7 @@ would then be signed (using signer.key) and finally published in /var/metadata/p
         return self.pipeline
 
     def __str__(self):
-        return "PL[{}]".format(self.pid)
+        return "PL[id={!s}]".format(self.pid)
 
     class Request(object):
         """
@@ -182,7 +196,7 @@ Represents a single request. When processing a set of pipelines a single request
 may modify any of the fields.
         """
 
-        def __init__(self, pl, md, t, name=None, args=None, state=None, store=None):
+        def __init__(self, pl, md, t=None, name=None, args=None, state=None, store=None, scheduler=None, raise_exceptions=True):
             if not state:
                 state = dict()
             if not args:
@@ -190,14 +204,40 @@ may modify any of the fields.
             self.plumbing = pl
             self.md = md
             self.t = t
+            self._id = None
             self.name = name
             self.args = args
             self.state = state
             self.done = False
             self._store = store
+            self.scheduler = scheduler
+            self.raise_exceptions = raise_exceptions
+            self.exception = None
+            self.parent = None
 
-        def lookup(self, member):
-            return self.md.lookup(member, store=self.store)
+        def scope_of(self, entry_point):
+            if 'with {}'.format(entry_point) in self.plumbing.pipeline:
+                return self
+            elif self.parent is None:
+                return self
+            else:
+                return self.parent.scope_of(entry_point)
+
+        @property
+        def id(self):
+            if self.t is None:
+                return None
+            if self._id is None:
+                self._id = self.t.get('entityID')
+            if self._id is None:
+                self._id = self.t.get('Name')
+            return self._id
+
+        def set_id(self, _id):
+            self._id = _id
+
+        def set_parent(self, _parent):
+            self.parent = _parent
 
         @property
         def store(self):
@@ -210,50 +250,19 @@ may modify any of the fields.
 
             :param pl: The plumbing to run this request through
             """
-            for p in pl.pipeline:
-                cb, opts, name, args = load_pipe(p)
-                log.debug("calling '{}' in {} using args: {} and opts: {}".format(name, pl, repr(args), repr(opts)))
-                # log.debug("traversing pipe %s,%s,%s using %s" % (pipe,name,args,opts))
-                if type(args) is str or type(args) is unicode:
-                    args = [args]
-                if args is not None and type(args) is not dict and type(args) is not list and type(args) is not tuple:
-                    raise PipeException("Unknown argument type %s" % repr(args))
-                self.args = args
-                self.name = name
-                ot = cb(self, *opts)
-                if ot is not None:
-                    self.t = ot
-                if self.done:
-                    break
-            return self.t
-
-    def process(self, md, args=None, state=None, t=None, store=None):
-        """
-The main entrypoint for processing a request pipeline. Calls the inner processor.
-
-
-:param md: The current metadata repository
-:param state: The active request state
-:param t: The active working document
-:param store: The store object to operate on
-:return: The result of applying the processing pipeline to t.
-        """
-        if not state:
-            state = dict()
-
-        return Plumbing.Request(self, md, t, args=args, state=state, store=store).process(self)
+            return pl.iprocess(self)
 
     def iprocess(self, req):
         """The inner request pipeline processor.
 
         :param req: The request to run through the pipeline
         """
-        log.debug("Processing {}".format(self.pipeline))
+        #log.debug("Processing {}".format(self.pipeline))
         for p in self.pipeline:
             try:
                 pipefn, opts, name, args = load_pipe(p)
-                # log.debug("traversing pipe %s,%s,%s using %s" % (pipe,name,args,opts))
-                if type(args) is str or type(args) is unicode:
+                log.debug("{!s}: calling '{}' using args: {} and opts: {}".format(self.pipeline, name, repr(args), repr(opts)))
+                if is_text(args):
                     args = [args]
                 if args is not None and type(args) is not dict and type(args) is not list and type(args) is not tuple:
                     raise PipeException("Unknown argument type %s" % repr(args))
@@ -264,10 +273,39 @@ The main entrypoint for processing a request pipeline. Calls the inner processor
                     req.t = ot
                 if req.done:
                     break
-            except PipeException as ex:
+            except BaseException as ex:
+                log.debug(traceback.format_exc())
                 log.error(ex)
+                req.exception = ex
+                if req.raise_exceptions:
+                    raise ex
                 break
         return req.t
+
+    def process(self, md, args=None, state=None, t=None, store=None, raise_exceptions=True, scheduler=None):
+        """
+        The main entrypoint for processing a request pipeline. Calls the inner processor.
+
+
+        :param scheduler: a scheduler for use in pipes
+        :param raise_exceptions: weather to raise or just log exceptions in the process
+        :param md: The current metadata repository
+        :param state: The active request state
+        :param t: The active working document
+        :param store: The store object to operate on
+        :param args: Pipeline arguments
+        :return: The result of applying the processing pipeline to t.
+        """
+        if not state:
+            state = dict()
+
+        return Plumbing.Request(self, md,
+                                t=t,
+                                args=args,
+                                state=state,
+                                store=store,
+                                raise_exceptions=raise_exceptions,
+                                scheduler=scheduler).process(self)
 
 
 def plumbing(fn):
